@@ -1,0 +1,504 @@
+import asyncio
+import logging
+from datetime import datetime
+from typing import Callable, Dict, Any, Awaitable
+
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode, ChatMemberStatus
+from aiogram.filters import CommandStart
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, TelegramObject
+)
+
+from sqlalchemy import BigInteger, String, Text, DateTime, Boolean, ForeignKey, select, update
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+
+# ==================== SOZLAMALAR (HARDCODED) ====================
+BOT_TOKEN = "8899004225:AAF4iEL08MnaVuNn1HbcNWh1Qp6zO1E1-v4"
+ADMIN_ID = 8318241400
+CHANNEL_ID = -1003940243822
+CHANNEL_LINK = "https://t.me/@anizone_2"  # O'zingizning kanal havolangiz
+
+# ==================== MA'LUMOTLAR BAZASI ====================
+DB_LITE = "sqlite+aiosqlite:///cyber_bot.db"
+
+engine = create_async_engine(DB_LITE, echo=False)
+async_session = async_sessionmaker(engine, expire_on_commit=False)
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    full_name: Mapped[str] = mapped_column(String(128))
+    is_subscribed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    questions: Mapped[list["Question"]] = relationship(back_populates="user")
+
+class Question(Base):
+    __tablename__ = "questions"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    question_text: Mapped[str] = mapped_column(Text)
+    answer_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    is_answered: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user: Mapped["User"] = relationship(back_populates="questions")
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
+# ==================== FSM STATE'LAR ====================
+class AskAdmin(StatesGroup):
+    waiting_for_question = State()
+
+class AnswerQuestion(StatesGroup):
+    waiting_for_answer = State()
+
+
+# ==================== MIDDLEWARE (MAJBURIY OBUNA) ====================
+class SubscriptionMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if not user:
+            return await handler(event, data)
+
+        # Admin uchun tekshiruvni o'tkazib yuboramiz
+        if user.id == ADMIN_ID:
+            return await handler(event, data)
+
+        # /start buyrug'i yoki obunani tekshirish tugmasi uchun
+        if isinstance(event, Message) and event.text and event.text.startswith("/start"):
+            return await handler(event, data)
+        if isinstance(event, CallbackQuery) and event.data == "check_sub":
+            return await handler(event, data)
+
+        bot = data["bot"]
+        try:
+            member = await bot.get_chat_member(CHANNEL_ID, user.id)
+            is_subscribed = member.status in {
+                ChatMemberStatus.MEMBER,
+                ChatMemberStatus.ADMINISTRATOR,
+                ChatMemberStatus.CREATOR,
+            }
+        except Exception:
+            is_subscribed = False
+
+        if not is_subscribed:
+            text = "⚠️ Botdan foydalanish uchun avval rasmiy kanalimizga obuna bo'ling!"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📢 Kanalga obuna bo'lish", url=CHANNEL_LINK)],
+                [InlineKeyboardButton(text="✅ Obunani tekshirish", callback_data="check_sub")]
+            ])
+            if isinstance(event, Message):
+                await event.answer(text, reply_markup=keyboard)
+            elif isinstance(event, CallbackQuery):
+                await event.message.answer(text, reply_markup=keyboard)
+                await event.answer()
+            return
+
+        return await handler(event, data)
+
+
+# ==================== KEBODLAR (TUGMALAR) ====================
+def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    kb = [
+        [KeyboardButton(text="🛡 Kiberxavfsizlik ma'lumotlari")],
+        [KeyboardButton(text="💻 Kali Linux buyruqlari")],
+        [KeyboardButton(text="💬 Adminga savol")],
+    ]
+    if is_admin:
+        kb.append([KeyboardButton(text="🛠 Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def kali_categories() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Information Gathering", callback_data="kali_cat:info")],
+        [InlineKeyboardButton(text="🌐 Web Application", callback_data="kali_cat:web")],
+        [InlineKeyboardButton(text="📡 Wireless", callback_data="kali_cat:wireless")],
+        [InlineKeyboardButton(text="🔐 Password Attacks", callback_data="kali_cat:password")],
+        [InlineKeyboardButton(text="🛠 Exploitation", callback_data="kali_cat:exploit")],
+        [InlineKeyboardButton(text="📦 Misc / Utils", callback_data="kali_cat:misc")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_main")],
+    ])
+
+def answer_keyboard(question_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✍️ Javob berish", callback_data=f"answer:{question_id}")]
+    ])
+
+
+# ==================== KALI LINUX BAZASI (100+ TERMINALLAR) ====================
+KALI_COMMANDS = {
+    "info": {
+        "nmap": {"desc": "Tarmoq skaneri – ochiq portlar, xizmatlar va OS aniqlash", "examples": ["nmap -sS -sV -O 192.168.1.1", "nmap -p 1-65535 -T4 -A target.com"]},
+        "masscan": {"desc": "Juda tez port skaneri (Internet-scale)", "examples": ["masscan -p1-65535 10.0.0.0/8 --rate=10000"]},
+        "netdiscover": {"desc": "Lokal tarmoqdagi qurilmalarni topish (ARP)", "examples": ["netdiscover -r 192.168.1.0/24"]},
+        "whois": {"desc": "Domen haqida ma'lumot", "examples": ["whois example.com"]},
+        "dig": {"desc": "DNS so'rovlarini bajarish", "examples": ["dig example.com ANY", "dig @8.8.8.8 example.com MX"]},
+        "dnsenum": {"desc": "DNS enumeratsiya", "examples": ["dnsenum example.com"]},
+        "theHarvester": {"desc": "Email, subdomain, host yig'ish", "examples": ["theHarvester -d example.com -b google,bing"]},
+        "recon-ng": {"desc": "Modular recon framework", "examples": ["recon-ng"]},
+        "maltego": {"desc": "Grafik OSINT va link analysis", "examples": ["maltego"]},
+        "shodan": {"desc": "Internet qurilmalarini qidirish (CLI)", "examples": ["shodan search apache country:UZ"]},
+        "amass": {"desc": "Subdomain enumeration", "examples": ["amass enum -d example.com"]},
+        "sublist3r": {"desc": "Subdomain topish", "examples": ["sublist3r -d example.com"]},
+        "fierce": {"desc": "DNS reconnaissance", "examples": ["fierce --domain example.com"]},
+        "dnsrecon": {"desc": "DNS recon tool", "examples": ["dnsrecon -d example.com"]},
+        "whatweb": {"desc": "Web texnologiyalarini aniqlash", "examples": ["whatweb https://example.com"]},
+        "wafw00f": {"desc": "WAF aniqlash", "examples": ["wafw00f https://example.com"]},
+    },
+    "web": {
+        "sqlmap": {"desc": "SQL Injection avtomatlashtirilgan tool", "examples": ["sqlmap -u 'http://site.com/page?id=1' --dbs"]},
+        "nikto": {"desc": "Web server vulnerability scanner", "examples": ["nikto -h http://target.com"]},
+        "gobuster": {"desc": "Directory / DNS / VHost bruteforce", "examples": ["gobuster dir -u http://target.com -w /usr/share/wordlists/dirb/common.txt"]},
+        "dirb": {"desc": "Web content scanner", "examples": ["dirb http://target.com"]},
+        "dirbuster": {"desc": "GUI directory bruteforcer", "examples": ["dirbuster"]},
+        "ffuf": {"desc": "Fast web fuzzer", "examples": ["ffuf -u http://target.com/FUZZ -w wordlist.txt"]},
+        "wfuzz": {"desc": "Web application fuzzer", "examples": ["wfuzz -c -z file,wordlist.txt --hc 404 http://target.com/FUZZ"]},
+        "burpsuite": {"desc": "Web security testing platform", "examples": ["burpsuite"]},
+        "owasp-zap": {"desc": "OWASP ZAP – free web app scanner", "examples": ["zaproxy"]},
+        "commix": {"desc": "Command injection exploitation", "examples": ["commix --url='http://target.com/page?id=1'"]},
+        "xsser": {"desc": "XSS exploitation tool", "examples": ["xsser -u 'http://target.com/search?q=XSS'"]},
+        "wpscan": {"desc": "WordPress vulnerability scanner", "examples": ["wpscan --url http://wp-site.com --enumerate u,p,t"]},
+        "joomscan": {"desc": "Joomla scanner", "examples": ["joomscan -u http://joomla-site.com"]},
+        "droopescan": {"desc": "Drupal / Joomla / WordPress scanner", "examples": ["droopescan scan drupal -u http://site.com"]},
+        "skipfish": {"desc": "Active web application security scanner", "examples": ["skipfish -o output http://target.com"]},
+        "arachni": {"desc": "Web application security scanner framework", "examples": ["arachni http://target.com"]},
+    },
+    "wireless": {
+        "aircrack-ng": {"desc": "Wi-Fi xavfsizlik audit to'plami", "examples": ["airmon-ng start wlan0", "airodump-ng wlan0mon"]},
+        "reaver": {"desc": "WPS PIN bruteforce", "examples": ["reaver -i wlan0mon -b BSSID -vv"]},
+        "bully": {"desc": "WPS attack tool", "examples": ["bully -b BSSID -c 6 wlan0mon"]},
+        "wifite": {"desc": "Avtomatik Wi-Fi attack tool", "examples": ["wifite"]},
+        "kismet": {"desc": "Wireless network detector / sniffer", "examples": ["kismet"]},
+        "fern-wifi-cracker": {"desc": "GUI Wi-Fi cracker", "examples": ["fern-wifi-cracker"]},
+        "fluxion": {"desc": "WPA social engineering attack", "examples": ["fluxion"]},
+        "mdk4": {"desc": "Wi-Fi testing tool (DoS, beacon flood)", "examples": ["mdk4 wlan0mon d"]},
+        "hcxdumptool": {"desc": "WPA/WPA2 handshake va PMKID olish", "examples": ["hcxdumptool -i wlan0mon -o capture.pcapng"]},
+        "hcxtools": {"desc": "Handshake / PMKID convert va crack", "examples": ["hcxpcapngtool -o hash.hc22000 capture.pcapng"]},
+    },
+    "password": {
+        "hydra": {"desc": "Network logon cracker (ko'p protokol)", "examples": ["hydra -l admin -P passwords.txt ssh://192.168.1.1"]},
+        "john": {"desc": "John the Ripper – password cracker", "examples": ["john --wordlist=rockyou.txt hashes.txt"]},
+        "hashcat": {"desc": "Eng kuchli GPU password cracker", "examples": ["hashcat -m 0 -a 0 hashes.txt rockyou.txt"]},
+        "medusa": {"desc": "Parallel network login auditor", "examples": ["medusa -h 192.168.1.1 -u admin -P pass.txt -M ssh"]},
+        "ncrack": {"desc": "High-speed network authentication cracking", "examples": ["ncrack -p 22 -U users.txt -P pass.txt 192.168.1.1"]},
+        "crunch": {"desc": "Wordlist generator", "examples": ["crunch 8 8 -t ,,,,%%%% -o wordlist.txt"]},
+        "cewl": {"desc": "Website dan wordlist yaratish", "examples": ["cewl http://target.com -w wordlist.txt"]},
+        "cupp": {"desc": "Common User Passwords Profiler", "examples": ["cupp -i"]},
+        "hash-identifier": {"desc": "Hash turini aniqlash", "examples": ["hash-identifier"]},
+        "hashid": {"desc": "Hash identifikatsiya", "examples": ["hashid '$1$...'"]},
+    },
+    "exploit": {
+        "metasploit": {"desc": "Eng mashhur exploitation framework", "examples": ["msfconsole", "use exploit/multi/handler"]},
+        "searchsploit": {"desc": "Exploit-DB offline qidiruv", "examples": ["searchsploit apache 2.4", "searchsploit -m 12345"]},
+        "setoolkit": {"desc": "Social-Engineer Toolkit", "examples": ["setoolkit"]},
+        "beef-xss": {"desc": "Browser Exploitation Framework", "examples": ["beef-xss"]},
+        "armitage": {"desc": "Metasploit GUI", "examples": ["armitage"]},
+        "routersploit": {"desc": "Router exploitation framework", "examples": ["rsf"]},
+    },
+    "misc": {
+        "netcat": {"desc": "TCP/UDP swiss army knife", "examples": ["nc -lvp 4444", "nc target.com 80"]},
+        "ncat": {"desc": "Nmap ning modern netcat", "examples": ["ncat -lvp 4444"]},
+        "tcpdump": {"desc": "Packet analyzer", "examples": ["tcpdump -i eth0 -w capture.pcap"]},
+        "wireshark": {"desc": "GUI packet analyzer", "examples": ["wireshark"]},
+        "socat": {"desc": "Multipurpose relay", "examples": ["socat TCP-LISTEN:4444,fork EXEC:/bin/bash"]},
+        "proxychains": {"desc": "Proxy orqali dasturlarni ishlatish", "examples": ["proxychains nmap -sT target.com"]},
+        "macchanger": {"desc": "MAC manzilni o'zgartirish", "examples": ["macchanger -r wlan0"]},
+        "bettercap": {"desc": "Network attack va monitoring framework", "examples": ["bettercap -iface eth0"]},
+        "responder": {"desc": "LLMNR/NBT-NS/MDNS poisoner", "examples": ["responder -I eth0"]},
+        "impacket": {"desc": "Python network protokol kutubxonasi", "examples": ["impacket-psexec domain/user:pass@target"]},
+        "bloodhound": {"desc": "Active Directory attack path analysis", "examples": ["bloodhound"]},
+        "crackmapexec": {"desc": "Swiss army knife for pentesting networks", "examples": ["crackmapexec smb 192.168.1.0/24 -u user -p pass"]},
+        "enum4linux": {"desc": "SMB enumeration", "examples": ["enum4linux -a 192.168.1.10"]},
+        "mimikatz": {"desc": "Windows credential dumping", "examples": ["mimikatz"]},
+        "winpeas": {"desc": "Windows Privilege Escalation Awesome Script", "examples": ["winPEASx64.exe"]},
+        "linpeas": {"desc": "Linux Privilege Escalation", "examples": ["./linpeas.sh"]},
+    }
+}
+
+CATEGORY_NAMES = {
+    "info": "🔍 Information Gathering",
+    "web": "🌐 Web Application",
+    "wireless": "📡 Wireless",
+    "password": "🔐 Password Attacks",
+    "exploit": "🛠 Exploitation",
+    "misc": "📦 Misc / Utils",
+}
+
+
+# ==================== HANDLER'LAR (ROUTER) ====================
+router = Router()
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    is_admin = (message.from_user.id == ADMIN_ID)
+    async with async_session() as session:
+        result = await session.execute(select(User).where(User.id == message.from_user.id))
+        user = result.scalar_one_or_none()
+        if not user:
+            user = User(
+                id=message.from_user.id,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name or "Foydalanuvchi",
+                is_subscribed=True
+            )
+            session.add(user)
+            await session.commit()
+
+    await message.answer(
+        "👋 Assalomu alaykum!\n\n"
+        "Kiberxavfsizlik va Kali Linux buyruqlari bo'yicha professional botga xush kelibsiz.",
+        reply_markup=main_menu(is_admin=is_admin)
+    )
+
+@router.callback_query(F.data == "check_sub")
+async def check_subscription(callback: CallbackQuery, bot: Bot):
+    try:
+        member = await bot.get_chat_member(CHANNEL_ID, callback.from_user.id)
+        is_sub = member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR}
+    except Exception:
+        is_sub = False
+
+    if is_sub:
+        await callback.message.edit_text("✅ Obuna tasdiqlandi!")
+        is_admin = (callback.from_user.id == ADMIN_ID)
+        await callback.message.answer("Asosiy menyu:", reply_markup=main_menu(is_admin=is_admin))
+    else:
+        await callback.answer("❌ Hali kanalga obuna bo'lmadingiz!", show_alert=True)
+
+# Kiberxavfsizlik ma'lumotlari
+@router.message(F.text == "🛡 Kiberxavfsizlik ma'lumotlari")
+async def cyber_info_handler(message: Message):
+    text = (
+        "🛡 **Kiberxavfsizlik Asoslari**\n\n"
+        "1. **CIA Triad (Asosiy Uchlik):**\n"
+        "   • Confidentiality (Maxfiylik)\n"
+        "   • Integrity (Yaxlitlik)\n"
+        "   • Availability (Mavjudlik)\n\n"
+        "2. **Ethical Hacking Bosqichlari:**\n"
+        "   • Reconnaissance (Ma'lumot yig'ish)\n"
+        "   • Scanning (Skanerlash)\n"
+        "   • Gaining Access (Kirish)\n"
+        "   • Maintaining Access (Saqlab qolish)\n"
+        "   • Covering Tracks (Izlarni yashirish)\n\n"
+        "3. **Asosiy qoidalar:**\n"
+        "   • Faqat o'zingizga tegishli yoki ruxsat berilgan tizimlarda sinov o'tkazing!"
+    )
+    await message.answer(text, parse_mode="Markdown")
+
+# Kali Linux menyusi
+@router.message(F.text == "💻 Kali Linux buyruqlari")
+async def kali_menu(message: Message):
+    await message.answer(
+        "💻 Kali Linux buyruqlari kategoriyalarini tanlang:",
+        reply_markup=kali_categories()
+    )
+
+@router.callback_query(F.data == "back_main")
+async def back_to_main(callback: CallbackQuery):
+    is_admin = (callback.from_user.id == ADMIN_ID)
+    await callback.message.delete()
+    await callback.message.answer("Asosiy menyu:", reply_markup=main_menu(is_admin=is_admin))
+
+@router.callback_query(F.data.startswith("kali_cat:"))
+async def show_category(callback: CallbackQuery):
+    cat = callback.data.split(":")[1]
+    commands = KALI_COMMANDS.get(cat, {})
+    if not commands:
+        await callback.answer("Bo'sh kategoriya")
+        return
+
+    buttons = []
+    for cmd in commands.keys():
+        buttons.append([InlineKeyboardButton(text=cmd, callback_data=f"kali_cmd:{cat}:{cmd}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="kali_back")])
+
+    await callback.message.edit_text(
+        f"{CATEGORY_NAMES.get(cat, cat)}\n\nBuyruqni tanlang:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+@router.callback_query(F.data.startswith("kali_cmd:"))
+async def show_command(callback: CallbackQuery):
+    _, cat, cmd = callback.data.split(":")
+    info = KALI_COMMANDS[cat][cmd]
+
+    text = f"📌 **{cmd}**\n\n📝 {info['desc']}\n\n💻 **Misollar:**\n"
+    for ex in info["examples"]:
+        text += f"`{ex}`\n"
+
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"kali_cat:{cat}")]
+        ])
+    )
+
+@router.callback_query(F.data == "kali_back")
+async def kali_back(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💻 Kali Linux buyruqlari kategoriyalarini tanlang:",
+        reply_markup=kali_categories()
+    )
+
+# --- ADMIN UCHUN SAVOL BERISH (FSM) ---
+@router.message(F.text == "💬 Adminga savol")
+async def ask_admin_start(message: Message, state: FSMContext):
+    await state.set_state(AskAdmin.waiting_for_question)
+    await message.answer(
+        "Kiberxavfsizlik yoki Kali Linux bo'yicha savolingizni yozib yuboring:\n\n"
+        "Bekor qilish uchun /cancel yuboring."
+    )
+
+@router.message(AskAdmin.waiting_for_question, F.text)
+async def process_question(message: Message, state: FSMContext, bot: Bot):
+    if message.text == "/cancel":
+        await state.clear()
+        is_admin = (message.from_user.id == ADMIN_ID)
+        await message.answer("Bekor qilindi.", reply_markup=main_menu(is_admin=is_admin))
+        return
+
+    async with async_session() as session:
+        question = Question(
+            user_id=message.from_user.id,
+            question_text=message.text
+        )
+        session.add(question)
+        await session.commit()
+        await session.refresh(question)
+
+    admin_text = (
+        f"📩 Yangi savol!\n\n"
+        f"👤 {message.from_user.full_name} (@{message.from_user.username or 'yoq'})\n"
+        f"ID: `{message.from_user.id}`\n\n"
+        f"💬 {message.text}"
+    )
+    await bot.send_message(
+        ADMIN_ID,
+        admin_text,
+        parse_mode="Markdown",
+        reply_markup=answer_keyboard(question.id)
+    )
+
+    await state.clear()
+    is_admin = (message.from_user.id == ADMIN_ID)
+    await message.answer(
+        "✅ Savolingiz adminga yuborildi. Tez orada javob olasiz.",
+        reply_markup=main_menu(is_admin=is_admin)
+    )
+
+# --- ADMIN PANEL VA JAVOB BERISH ---
+@router.message(F.text == "🛠 Admin Panel")
+async def admin_panel(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    async with async_session() as session:
+        result = await session.execute(select(Question).where(Question.is_answered == False))
+        unanswered = result.scalars().all()
+
+    await message.answer(
+        f"🛠 **Admin Panel**\n\n"
+        f"Javob berilmagan savollar soni: {len(unanswered)} ta\n"
+        "Foydalanuvchilar savollariga ularning xabari ostidagi tugma orqali javob bering.",
+        parse_mode="Markdown"
+    )
+
+@router.callback_query(F.data.startswith("answer:"))
+async def start_answer(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Faqat admin uchun!", show_alert=True)
+        return
+
+    question_id = int(callback.data.split(":")[1])
+    await state.set_state(AnswerQuestion.waiting_for_answer)
+    await state.update_data(question_id=question_id)
+
+    await callback.message.answer(
+        f"Foydalanuvchiga yubormoqchi bo'lgan javobingizni yozing (Savol ID: {question_id}):\n"
+        "Bekor qilish uchun /cancel yuboring."
+    )
+    await callback.answer()
+
+@router.message(AnswerQuestion.waiting_for_answer, F.text)
+async def process_answer(message: Message, state: FSMContext, bot: Bot):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Bekor qilindi.")
+        return
+
+    data = await state.get_data()
+    question_id = data["question_id"]
+
+    async with async_session() as session:
+        result = await session.execute(select(Question).where(Question.id == question_id))
+        question = result.scalar_one_or_none()
+        if not question:
+            await message.answer("Savol topilmadi.")
+            await state.clear()
+            return
+
+        question.answer_text = message.text
+        question.is_answered = True
+        await session.commit()
+
+        await bot.send_message(
+            question.user_id,
+            f"📬 Admindan javob:\n\n{message.text}"
+        )
+
+    await state.clear()
+    await message.answer("✅ Javob foydalanuvchiga muvaffaqiyatli yuborildi.")
+
+
+# ==================== BOTNI ISHGA TUSHIRISH (MAIN) ====================
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    
+    # Ma'lumotlar bazasini yaratish
+    await init_db()
+
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    # Middleware ulash
+    dp.message.middleware(SubscriptionMiddleware())
+    dp.callback_query.middleware(SubscriptionMiddleware())
+
+    # Router'ni ulash
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🤖 Kiberxavfsizlik va Kali Linux boti muvaffaqiyatli ishga tushdi!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Bot to'xtatildi!")
